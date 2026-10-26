@@ -1,0 +1,279 @@
+name: AKS CI-CD Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      branch-name:
+        description: "Rama que se procesa"
+        required: true
+        type: string
+
+      image-name:
+        description: "Nombre de la imagen Docker"
+        required: true
+        type: string
+
+      dockerfile-path:
+        description: "Directorio que contiene el Dockerfile"
+        required: true
+        type: string
+
+      deployment-file:
+        description: "Ruta del manifiesto Kubernetes"
+        required: true
+        type: string
+
+      deployment-name:
+        description: "Nombre del Deployment Kubernetes"
+        required: true
+        type: string
+
+      container-name:
+        description: "Nombre del contenedor Kubernetes"
+        required: true
+        type: string
+
+      target-environment:
+        description: "Ambiente de destino"
+        required: false
+        type: string
+        default: DEV
+
+      image-tag:
+        description: "Etiqueta de la imagen para QA o PROD"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ==========================================
+  # 1. VALIDACION DE PULL REQUEST
+  # ==========================================
+
+  validate:
+    name: Validate Pull Request
+
+    if: github.event_name == 'pull_request'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.dockerfile-path }}
+          file: ${{ inputs.dockerfile-path }}/Dockerfile
+          push: false
+
+  # ==========================================
+  # 2. PREPARAR IMAGEN
+  # ==========================================
+
+  prepare-image:
+    name: Prepare Container Image
+
+    if: github.event_name == 'workflow_dispatch'
+
+    runs-on: [self-hosted, Windows, X64]
+
+    outputs:
+      image-tag: ${{ steps.image-info.outputs.image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment parameters
+        shell: pwsh
+        env:
+          TARGET_ENV: ${{ inputs.target-environment }}
+          BRANCH_NAME: ${{ inputs.branch-name }}
+          INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ($env:TARGET_ENV -notin @("DEV", "QA", "PROD")) {
+            throw "Ambiente no permitido."
+          }
+
+          if ($env:TARGET_ENV -ne "DEV" -and
+              [string]::IsNullOrWhiteSpace($env:INPUT_IMAGE_TAG)) {
+            throw "QA y PROD requieren una etiqueta de imagen existente."
+          }
+
+          if ($env:TARGET_ENV -eq "PROD" -and
+              $env:BRANCH_NAME -notmatch '^release/') {
+            throw "Producción solo permite despliegues desde release/*."
+          }
+
+      - name: Define image tag
+        id: image-info
+        shell: pwsh
+        env:
+          TARGET_ENV: ${{ inputs.target-environment }}
+          INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          if ($env:TARGET_ENV -eq "DEV") {
+            $tag = "${{ github.sha }}"
+          }
+          else {
+            $tag = $env:INPUT_IMAGE_TAG
+          }
+
+          "image-tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Azure login
+        if: inputs.target-environment == 'DEV'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        if: inputs.target-environment == 'DEV'
+        shell: pwsh
+        env:
+          ACR_NAME: ${{ vars.ACR_NAME }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          az acr login --name $env:ACR_NAME
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Error autenticando con ACR."
+          }
+
+      - name: Build and push image
+        if: inputs.target-environment == 'DEV'
+        shell: pwsh
+        env:
+          DOCKERFILE_PATH: ${{ inputs.dockerfile-path }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_TAG: ${{ steps.image-info.outputs.image-tag }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $image = "$($env:ACR_LOGIN_SERVER)/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+          $dockerfile = Join-Path $env:DOCKERFILE_PATH "Dockerfile"
+
+          docker build --file $dockerfile --tag $image $env:DOCKERFILE_PATH
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Error construyendo la imagen."
+          }
+
+          docker push $image
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Error publicando la imagen."
+          }
+
+  # ==========================================
+  # 3. DESPLIEGUE CON APROBACION
+  # ==========================================
+
+  deploy:
+    name: Deploy to AKS
+
+    needs: prepare-image
+
+    runs-on: [self-hosted, Windows, X64]
+
+    environment:
+      name: ${{ inputs.target-environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Configure AKS context
+        shell: pwsh
+        env:
+          RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          az aks get-credentials `
+            --resource-group $env:RESOURCE_GROUP `
+            --name $env:AKS_CLUSTER_NAME `
+            --overwrite-existing
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo conectar con AKS."
+          }
+
+      - name: Apply Kubernetes manifests
+        shell: pwsh
+        env:
+          DEPLOYMENT_FILE: ${{ inputs.deployment-file }}
+          AKS_NAMESPACE: ${{ vars.AKS_NAMESPACE }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          kubectl apply `
+            --filename $env:DEPLOYMENT_FILE `
+            --namespace $env:AKS_NAMESPACE
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Error aplicando los manifiestos."
+          }
+
+      - name: Update container image
+        shell: pwsh
+        env:
+          AKS_NAMESPACE: ${{ vars.AKS_NAMESPACE }}
+          DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+          CONTAINER_NAME: ${{ inputs.container-name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_TAG: ${{ needs.prepare-image.outputs.image-tag }}
+          ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $image = "$($env:ACR_LOGIN_SERVER)/$($env:IMAGE_NAME):$($env:IMAGE_TAG)"
+          $container = "$($env:CONTAINER_NAME)=$image"
+          $deployment = "deployment/$($env:DEPLOYMENT_NAME)"
+
+          kubectl set image $deployment $container `
+            --namespace $env:AKS_NAMESPACE
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Error actualizando la imagen."
+          }
+
+      - name: Verify deployment
+        shell: pwsh
+        env:
+          AKS_NAMESPACE: ${{ vars.AKS_NAMESPACE }}
+          DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          kubectl rollout status `
+            "deployment/$($env:DEPLOYMENT_NAME)" `
+            --namespace $env:AKS_NAMESPACE `
+            --timeout=180s
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "El despliegue no finalizó correctamente."
+          }
