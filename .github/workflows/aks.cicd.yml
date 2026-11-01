@@ -59,7 +59,7 @@ jobs:
   validate-pull-request:
     name: Validate container build
     if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted]
 
     steps:
       - name: Checkout repository
@@ -80,7 +80,7 @@ jobs:
   prepare-image:
     name: Build and publish container image
     if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted]
 
     permissions:
       contents: read
@@ -198,7 +198,7 @@ jobs:
     needs: prepare-image
     if: github.event_name != 'pull_request'
 
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [self-hosted]
 
     environment:
       name: ${{ inputs.target-environment }}
